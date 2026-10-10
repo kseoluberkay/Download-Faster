@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Net.NetworkInformation;
 using DownloadFaster.Core;
+using DownloadFaster.Core.Proxy;
 
 namespace DownloadFaster.App;
 
@@ -16,9 +18,13 @@ internal sealed class MainForm : Form
     private readonly Dictionary<string, double> _testResults = [];
     private readonly List<AdapterRow> _adapterRows = [];
     private readonly List<DownloadItem> _downloads = [];
+    private readonly ConnectionBalancer _balancer;
     private IReadOnlyList<NetworkRoute> _routes = [];
+    private LocalProxyServer? _proxy;
     private bool _initialized;
     private bool _closingAfterPause;
+    private bool _keepHidden;
+    private bool _exiting;
 
     private readonly ToolTip _tips = new() { AutoPopDelay = 20000, InitialDelay = 400 };
     private readonly TextBox _urlBox = new();
@@ -39,29 +45,46 @@ internal sealed class MainForm : Form
     private readonly ToolStripStatusLabel _statusLabel = new();
     private readonly ToolStripStatusLabel _activeLabel = new();
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 500 };
+    private readonly System.Windows.Forms.Timer _adapterRescan = new() { Interval = 2000 };
+    private readonly CheckBox _allAppsBox = new();
+    private readonly ComboBox _spreadBox = new();
+    private readonly CheckBox _startupBox = new();
+    private readonly Label _allAppsStatus = new();
+    private readonly NotifyIcon _tray = new();
+    private readonly ToolStripMenuItem _trayAllApps = new("Speed up all apps");
 
-    public MainForm()
+    /// <param name="startHidden">Start in the notification area only, as when launched at sign-in.</param>
+    public MainForm(bool startHidden = false)
     {
+        _keepHidden = startHidden;
+        _balancer = new ConnectionBalancer(() => _routes, _options)
+        {
+            Policy = _settings.Spread,
+            DownloadHosts = [.. ConnectionBalancer.DefaultDownloadHosts, .. _settings.ExtraDownloadHosts],
+        };
+
         SuspendLayout();
         AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
         Text = AppName;
         Icon = LoadIcon();
-        ClientSize = new Size(1000, 700);
-        MinimumSize = new Size(820, 560);
+        ClientSize = new Size(1000, 790);
+        MinimumSize = new Size(820, 640);
         StartPosition = FormStartPosition.CenterScreen;
 
         _options.Mode = _settings.Mode;
         _options.ChunkSizeBytes = Math.Clamp(_settings.ChunkSizeMB, 1, 64) * DownloadOptions.MiB;
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(10, 8, 10, 4) };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(10, 8, 10, 4) };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.Controls.Add(BuildLinkPanel(), 0, 0);
+        root.Controls.Add(BuildAllAppsGroup(), 0, 0);
         root.Controls.Add(BuildAdapterGroup(), 0, 1);
-        root.Controls.Add(BuildDownloadsGroup(), 0, 2);
+        root.Controls.Add(BuildLinkPanel(), 0, 2);
+        root.Controls.Add(BuildDownloadsGroup(), 0, 3);
         Controls.Add(root);
         Controls.Add(BuildStatusStrip());
 
@@ -72,16 +95,237 @@ internal sealed class MainForm : Form
         PerformLayout();
         _initialized = true;
 
+        BuildTray();
+
+        // Re-scan adapters when cables, Wi-Fi networks or addresses change.
+        _adapterRescan.Tick += (_, _) =>
+        {
+            _adapterRescan.Stop();
+            LoadAdapters();
+        };
+        NetworkChange.NetworkAddressChanged += OnNetworkChanged;
+
         _timer.Tick += (_, _) => RefreshView();
         _timer.Start();
+
+        if (_settings.AllApps)
+        {
+            SetAllApps(true);
+        }
+
         RefreshView();
+    }
+
+    /// <summary>Brings the window back from the notification area.</summary>
+    public void ShowFromTray()
+    {
+        _keepHidden = false;
+        Show();
+        if (WindowState == FormWindowState.Minimized)
+        {
+            WindowState = FormWindowState.Normal;
+        }
+
+        Activate();
+    }
+
+    protected override void SetVisibleCore(bool value)
+    {
+        if (_keepHidden && value)
+        {
+            // Started at sign-in: create the window so timers and the tray work, but keep it hidden.
+            if (!IsHandleCreated)
+            {
+                CreateHandle();
+            }
+
+            value = false;
+        }
+
+        base.SetVisibleCore(value);
     }
 
     // ---------------------------------------------------------------- layout
 
+    private Control BuildAllAppsGroup()
+    {
+        var group = new GroupBox
+        {
+            Text = "Speed up all apps",
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new Padding(10, 6, 10, 6),
+            Margin = new Padding(0, 0, 0, 8),
+        };
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1 };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        var top = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Margin = new Padding(0) };
+        _allAppsBox.Text = "Use all adapters for browsers, Steam and other apps";
+        _allAppsBox.AutoSize = true;
+        _allAppsBox.Font = new Font(Font, FontStyle.Bold);
+        _allAppsBox.Margin = new Padding(3, 6, 12, 3);
+        _allAppsBox.Checked = _settings.AllApps;
+        _allAppsBox.CheckedChanged += (_, _) =>
+        {
+            if (_allAppsBox.Checked != (_proxy is not null))
+            {
+                SetAllApps(_allAppsBox.Checked);
+            }
+        };
+        _tips.SetToolTip(_allAppsBox,
+            "Points Windows' proxy setting at Download Faster, which sends each new connection out through one of your adapters." +
+            Environment.NewLine + "Apps that follow the Windows proxy setting use it automatically. Turning it off restores your previous settings.");
+
+        _spreadBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _spreadBox.Width = 330;
+        _spreadBox.Items.AddRange([
+            "Spread downloads only (safest, recommended)",
+            "Keep each website on one adapter",
+            "Spread every connection (fastest, may log you out)",
+        ]);
+        _spreadBox.SelectedIndex = (int)_settings.Spread;
+        _spreadBox.SelectedIndexChanged += (_, _) =>
+        {
+            _balancer.Policy = (SpreadPolicy)_spreadBox.SelectedIndex;
+            SaveSettings();
+        };
+        _tips.SetToolTip(_spreadBox,
+            "Spread downloads only: game and update downloads (Steam, Epic, Windows and more, plus any plain-HTTP download) use every adapter;" +
+            Environment.NewLine + "other sites stay on one adapter, so logins and video sites never see your address change." +
+            Environment.NewLine + "Keep each website on one adapter: different sites use different adapters." +
+            Environment.NewLine + "Spread every connection: fastest, but some sites may log you out or refuse videos.");
+
+        _startupBox.Text = "Start with Windows";
+        _startupBox.AutoSize = true;
+        _startupBox.Margin = new Padding(12, 6, 3, 3);
+        _startupBox.Checked = StartupRegistration.IsEnabled;
+        _startupBox.CheckedChanged += (_, _) => StartupRegistration.Set(_startupBox.Checked);
+        _tips.SetToolTip(_startupBox, "Starts Download Faster in the notification area when you sign in, so all apps keep using every adapter.");
+
+        _allAppsStatus.AutoSize = true;
+        _allAppsStatus.Margin = new Padding(12, 8, 3, 3);
+
+        top.Controls.Add(_allAppsBox);
+        top.Controls.Add(_spreadBox);
+        top.Controls.Add(_startupBox);
+        top.Controls.Add(_allAppsStatus);
+
+        var hint = new Label
+        {
+            AutoSize = true,
+            ForeColor = SystemColors.GrayText,
+            Margin = new Padding(3, 4, 3, 0),
+            Text = "Helps apps that open several connections at once, like Steam. Restart Steam after switching this on. " +
+                "A single browser download still uses one adapter: paste its link below to split it.",
+        };
+
+        layout.Controls.Add(top, 0, 0);
+        layout.Controls.Add(hint, 0, 1);
+        group.Controls.Add(layout);
+        return group;
+    }
+
+    private void BuildTray()
+    {
+        // Menu actions run after the menu has closed, so they never tear down a window under it.
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("Open Download Faster", null, (_, _) => OnUiThread(ShowFromTray));
+        _trayAllApps.CheckOnClick = true;
+        _trayAllApps.Checked = _allAppsBox.Checked;
+        _trayAllApps.Click += (_, _) => OnUiThread(() => _allAppsBox.Checked = _trayAllApps.Checked);
+        menu.Items.Add(_trayAllApps);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Exit", null, (_, _) => OnUiThread(ExitApp));
+
+        _tray.Icon = Icon ?? SystemIcons.Application;
+        _tray.Text = AppName;
+        _tray.ContextMenuStrip = menu;
+        _tray.Visible = true;
+        _tray.DoubleClick += (_, _) => ShowFromTray();
+    }
+
+    private void ExitApp()
+    {
+        _exiting = true;
+        _keepHidden = false;
+        Close();
+    }
+
+    /// <summary>Turns the all-apps proxy and the Windows proxy setting on or off.</summary>
+    private async void SetAllApps(bool on)
+    {
+        if (on)
+        {
+            if (!SystemProxyGuard.IsSupported)
+            {
+                _allAppsBox.Checked = false;
+                return;
+            }
+
+            try
+            {
+                if (_proxy is null)
+                {
+                    var proxy = new LocalProxyServer(_balancer, _settings.ProxyPort);
+                    proxy.Start();
+                    _proxy = proxy;
+                }
+
+                SystemProxyGuard.Enable(_proxy.Port);
+            }
+            catch (Exception ex) when (ex is System.Net.Sockets.SocketException or IOException or UnauthorizedAccessException
+                or System.ComponentModel.Win32Exception)
+            {
+                MessageBox.Show(this, $"Could not turn on all-apps mode: {ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                await StopProxyAsync();
+                _allAppsBox.Checked = false;
+            }
+        }
+        else
+        {
+            await StopProxyAsync();
+        }
+
+        _trayAllApps.Checked = _proxy is not null;
+        if (_initialized)
+        {
+            SaveSettings();
+        }
+
+        RefreshView();
+    }
+
+    private async Task StopProxyAsync()
+    {
+        try
+        {
+            SystemProxyGuard.Disable();
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            // Nothing else we can do; the watchdog and the next start will try again.
+        }
+
+        if (_proxy is { } proxy)
+        {
+            _proxy = null;
+            await proxy.DisposeAsync();
+        }
+    }
+
+    private void OnNetworkChanged(object? sender, EventArgs e) =>
+        OnUiThread(() =>
+        {
+            _adapterRescan.Stop();
+            _adapterRescan.Start();
+        });
+
     private Control BuildLinkPanel()
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3, RowCount = 2, Margin = new Padding(0, 0, 0, 6) };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3, RowCount = 2, Margin = new Padding(0, 0, 0, 4) };
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -774,24 +1018,54 @@ internal sealed class MainForm : Form
             UpdateRow(item);
         }
 
+        // Traffic from other apps going through the all-apps proxy.
+        int appConnections = 0;
+        double appSpeed = 0;
+        if (_proxy is not null)
+        {
+            foreach (var traffic in _balancer.GetTraffic())
+            {
+                speedByRoute[traffic.RouteId] = speedByRoute.GetValueOrDefault(traffic.RouteId) + traffic.BytesPerSecond;
+                appConnections += traffic.ActiveConnections;
+                appSpeed += traffic.BytesPerSecond;
+            }
+
+            totalSpeed += appSpeed;
+        }
+
+        bool busy = active > 0 || _proxy is not null;
         foreach (var row in _adapterRows)
         {
             string id = row.Route.Id;
             row.ShowStatus(
                 speedByRoute.GetValueOrDefault(id),
-                active > 0,
+                busy,
                 problemByRoute.GetValueOrDefault(id),
                 _testResults.TryGetValue(id, out double tested) ? tested : null);
         }
 
-        if (active > 0)
+        UpdateAllAppsStatus(appConnections, appSpeed);
+
+        if (busy)
         {
             var parts = _adapterRows
                 .Where(r => speedByRoute.GetValueOrDefault(r.Route.Id) > 0)
                 .Select(r => $"{r.Route.Name} {Units.Speed(speedByRoute[r.Route.Id])}");
             _statusLabel.Text = $"Total {Units.Speed(totalSpeed)} ({Units.Mbps(totalSpeed)})    " + string.Join("  +  ", parts);
-            _activeLabel.Text = active == 1 ? "1 download running" : $"{active} downloads running";
-            Text = $"{Units.Speed(totalSpeed)} - {AppName}";
+            var activity = new List<string>();
+            if (active > 0)
+            {
+                activity.Add(active == 1 ? "1 download running" : $"{active} downloads running");
+            }
+
+            if (_proxy is not null)
+            {
+                activity.Add($"all apps: {appConnections} connections");
+            }
+
+            _activeLabel.Text = string.Join(", ", activity);
+            Text = totalSpeed > 0 ? $"{Units.Speed(totalSpeed)} - {AppName}" : AppName;
+            _tray.Text = Truncate($"{AppName}: {Units.Speed(totalSpeed)}", 63);
         }
         else
         {
@@ -805,10 +1079,28 @@ internal sealed class MainForm : Form
             };
             _activeLabel.Text = "";
             Text = AppName;
+            _tray.Text = AppName;
         }
 
         UpdateButtons();
     }
+
+    private void UpdateAllAppsStatus(int connections, double speed)
+    {
+        if (_proxy is null)
+        {
+            _allAppsStatus.Text = SystemProxyGuard.IsSupported ? "Off" : "Only available on Windows";
+            _allAppsStatus.ForeColor = SystemColors.GrayText;
+        }
+        else
+        {
+            _allAppsStatus.Text = $"On: {connections} app connections, {Units.Speed(speed)}";
+            _allAppsStatus.ForeColor = Color.SeaGreen;
+            _tips.SetToolTip(_allAppsStatus, $"Apps reach Download Faster at 127.0.0.1:{_proxy.Port} (HTTP and SOCKS5).");
+        }
+    }
+
+    private static string Truncate(string text, int max) => text.Length <= max ? text : text[..max];
 
     private static void UpdateRow(DownloadItem item)
     {
@@ -991,6 +1283,22 @@ internal sealed class MainForm : Form
 
     protected override async void OnFormClosing(FormClosingEventArgs e)
     {
+        if (!_exiting && e.CloseReason == CloseReason.UserClosing && _proxy is not null)
+        {
+            // All-apps mode keeps working in the background; Exit is in the tray menu.
+            e.Cancel = true;
+            Hide();
+            if (!_settings.TrayHintShown)
+            {
+                _tray.ShowBalloonTip(5000, AppName,
+                    "Still speeding up your apps. Right-click this icon to open Download Faster or exit.", ToolTipIcon.Info);
+                _settings.TrayHintShown = true;
+                SaveSettings();
+            }
+
+            return;
+        }
+
         if (!_closingAfterPause && _downloads.Any(d => d.IsRunning))
         {
             // Pause everything first so each download saves where it got to.
@@ -1010,7 +1318,19 @@ internal sealed class MainForm : Form
         }
 
         _timer.Stop();
+        NetworkChange.NetworkAddressChanged -= OnNetworkChanged;
         SaveSettings();
+
+        // Hand the user's own proxy settings back before exiting.
+        try
+        {
+            SystemProxyGuard.Disable();
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+        }
+
+        _tray.Visible = false;
         base.OnFormClosing(e);
     }
 
@@ -1023,6 +1343,12 @@ internal sealed class MainForm : Form
 
         _settings.DownloadFolder = _folderBox.Text.Trim();
         _settings.Mode = _options.Mode;
+        _settings.Spread = _balancer.Policy;
+        if (!_exiting && !_closingAfterPause)
+        {
+            _settings.AllApps = _proxy is not null;
+        }
+
         _settings.ChunkSizeMB = (int)(_options.ChunkSizeBytes / DownloadOptions.MiB);
         foreach (var route in _routes)
         {

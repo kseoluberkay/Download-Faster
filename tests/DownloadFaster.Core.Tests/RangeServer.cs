@@ -31,6 +31,9 @@ internal sealed class RangeServer : IAsyncDisposable
     /// <summary>Bytes sent per client address.</summary>
     public ConcurrentDictionary<string, long> BytesByClient { get; } = new();
 
+    /// <summary>Requests received per client address.</summary>
+    public ConcurrentDictionary<string, int> RequestsByClient { get; } = new();
+
     /// <summary>Speed caps per client address, in bytes per second.</summary>
     public ConcurrentDictionary<string, long> ThrottleByClient { get; } = new();
 
@@ -70,9 +73,30 @@ internal sealed class RangeServer : IAsyncDisposable
     private async Task HandleAsync(HttpContext context)
     {
         string client = context.Connection.RemoteIpAddress!.MapToIPv4().ToString();
+        RequestsByClient.AddOrUpdate(client, 1, (_, n) => n + 1);
         if (Interlocked.Decrement(ref RejectNextRequests) >= 0)
         {
             context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return;
+        }
+
+        if (context.Request.Path == "/echo")
+        {
+            // Sends the request body back without a length, so the response is chunked.
+            await context.Request.Body.CopyToAsync(context.Response.Body);
+            return;
+        }
+
+        if (context.Request.Path == "/chunked")
+        {
+            int count = Math.Min(Content.Length, 300 * 1024);
+            for (int offset = 0; offset < count; offset += 7000)
+            {
+                await context.Response.Body.WriteAsync(Content.AsMemory(offset, Math.Min(7000, count - offset)));
+                await context.Response.Body.FlushAsync();
+            }
+
+            BytesByClient.AddOrUpdate(client, count, (_, total) => total + count);
             return;
         }
 

@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using DownloadFaster.Core;
+using DownloadFaster.Core.Proxy;
 
 namespace DownloadFaster.App;
 
@@ -21,6 +22,19 @@ internal sealed class AppSettings
     public int ChunkSizeMB { get; set; } = 4;
 
     public string SpeedTestUrl { get; set; } = SpeedTest.DefaultUrl.ToString();
+
+    /// <summary>Whether other apps (browsers, Steam) are routed through the adapters via the system proxy.</summary>
+    public bool AllApps { get; set; }
+
+    public SpreadPolicy Spread { get; set; } = SpreadPolicy.DownloadsOnly;
+
+    /// <summary>Port of the local all-apps proxy. The next free port is used if it is taken.</summary>
+    public int ProxyPort { get; set; } = 48842;
+
+    /// <summary>More hosts to treat as pure download servers, on top of the built-in list.</summary>
+    public List<string> ExtraDownloadHosts { get; set; } = [];
+
+    public bool TrayHintShown { get; set; }
 
     /// <summary>Per-adapter settings keyed by Windows' adapter id.</summary>
     public Dictionary<string, AdapterPrefs> Adapters { get; set; } = [];

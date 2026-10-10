@@ -63,7 +63,7 @@ internal sealed partial class AdapterRow
             TextAlign = HorizontalAlignment.Center,
             Margin = new Padding(3, 3, 12, 3),
         };
-        tips.SetToolTip(_connections, "Parallel connections through this adapter. More helps on fast or distant servers; 4-8 is usually plenty.");
+        tips.SetToolTip(_connections, "Parallel connections through this adapter for downloads started here (the link box). 4-8 is usually plenty. Other apps decide their own number of connections.");
 
         _limit = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, Width = px(96), Anchor = AnchorStyles.Left, Margin = new Padding(3, 3, 12, 3) };
         _limit.Items.AddRange(LimitChoices);
